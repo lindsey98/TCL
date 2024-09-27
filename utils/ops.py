@@ -13,7 +13,8 @@ from torch import nn
 import torch
 from typing import Union
 import torch.distributed as dist
-from torch._six import string_classes
+# from torch._six import string_classes
+string_classes=str
 import torch.nn.functional as F
 import collections.abc as container_abcs
 from PIL import Image

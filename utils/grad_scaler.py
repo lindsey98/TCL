@@ -8,8 +8,7 @@
 @Date    : 2022/1/18 8:29 PM 
 '''
 import torch
-from torch._six import inf
-
+from  torch import inf
 
 def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
     if isinstance(parameters, torch.Tensor):

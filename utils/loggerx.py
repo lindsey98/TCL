@@ -20,7 +20,7 @@ from torchvision.utils import save_image
 import torch.distributed as dist
 import math
 import inspect
-from torch._six import string_classes
+string_classes = str
 import collections.abc as container_abcs
 import warnings
 from utils.ops import load_network
@@ -62,9 +62,9 @@ class LoggerX(object):
         self.world_size = dist.get_world_size()
         self.local_rank = dist.get_rank()
         self.enable_wandb = enable_wandb
-        if enable_wandb and self.local_rank == 0:
-            import wandb
-            wandb.init(dir=save_root, settings=wandb.Settings(_disable_stats=True, _disable_meta=True), **kwargs)
+        # if enable_wandb and self.local_rank == 0:
+        #     import wandb
+        #     wandb.init(dir=save_root, settings=wandb.Settings(_disable_stats=True, _disable_meta=True), **kwargs)
 
     @property
     def modules(self):
@@ -118,16 +118,16 @@ class LoggerX(object):
             output_str += '{} {:2.5f}, '.format(var_name, var)
             output_dict[var_name] = var
 
-        if self.enable_wandb and self.local_rank == 0:
-            import wandb
-            wandb.log(output_dict, step)
+        # if self.enable_wandb and self.local_rank == 0:
+        #     import wandb
+        #     wandb.log(output_dict, step)
 
-        if self.local_rank == 0:
-            print(output_str)
+        # if self.local_rank == 0:
+        print(output_str)
 
     def msg_str(self, output_str):
-        if self.local_rank == 0:
-            print(str(output_str))
+        # if self.local_rank == 0:
+        print(str(output_str))
 
     def save_image(self, img, n_iter, sample_type):
         if isinstance(img, torch.Tensor):

@@ -10,6 +10,10 @@
 
 import torch
 import torch.distributed as dist
+import os
+# os.environ['MASTER_ADDR'] = 'localhost'
+# os.environ['MASTER_PORT'] = '12355'
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 import numpy as np
 import random
 from PIL import ImageFile
@@ -22,6 +26,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from models.basic_template import TrainTask
 from models import model_dict
+
 
 if __name__ == '__main__':
     config_path = sys.argv[1]
@@ -42,10 +47,12 @@ if __name__ == '__main__':
     for k in configs:
         setattr(opt, k, configs[k])
     if opt.dist:
-        dist.init_process_group(backend='nccl', init_method='env://')
+        dist.init_process_group(backend='nccl',
+                                init_method='env://')
         torch.cuda.set_device(dist.get_rank())
     if opt.num_devices > 0:
         assert opt.num_devices == torch.cuda.device_count()  # total batch size
+
     seed = opt.seed
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True

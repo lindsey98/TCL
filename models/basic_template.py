@@ -16,8 +16,7 @@ from utils import TwoCropTransform, extract_features
 from utils.ops import convert_to_cuda, is_root_worker, dataset_with_indices
 from utils.grad_scaler import NativeScalerWithGradNormCount
 from utils.loggerx import LoggerX
-import torch_clustering
-
+import faiss
 
 class TrainTask(object):
     single_view = False
@@ -89,7 +88,7 @@ class TrainTask(object):
         parser.add_argument('--whole_dataset', action='store_true', help='use whole dataset')
         parser.add_argument('--pin_memory', action='store_true', help='pin_memory for dataloader')
         parser.add_argument('--dataset', type=str, default='cifar10', help='dataset')
-        parser.add_argument('--data_folder', type=str, default='/home/zzhuang/DATASET/clustering',
+        parser.add_argument('--data_folder', type=str, default='./datasets',
                             help='path to custom dataset')
         parser.add_argument('--label_file', type=str, default=None, help='path to label file (numpy format)')
         parser.add_argument('--img_size', type=int, default=32, help='parameter for RandomResizedCrop')
@@ -106,14 +105,21 @@ class TrainTask(object):
         parser.add_argument('--data_resample', help='data_resample', action='store_true')
         parser.add_argument('--reassign', type=int, help='reassign kmeans', default=1)
 
+        ## Add customized arguments
+        parser.add_argument('--test_hard_indices', type=str, help='path to hard testing indices',
+                            default='./datasets/test_hard_ids_lt_train02aum.npy')
+        parser.add_argument('--noise_ratio', type=float, help='noise ratio')
         return parser
 
     @staticmethod
     def build_options():
         pass
 
-    @staticmethod
-    def create_dataset(data_root, dataset_name, train, transform=None, memory=False, label_file=None,
+    def create_dataset(self,
+                       data_root, dataset_name, train, transform=None, memory=False,
+                       label_file=None,
+                       noise_ratio=0.3,
+                       filtered_index=None, filter_out=False
                        ):
         has_subfolder = False
         if dataset_name in ['cifar10', 'cifar20', 'cifar100']:
@@ -161,12 +167,37 @@ class TrainTask(object):
                     osp.join(data_root, dataset_name, 'train' if train else 'val'), transform=transform)
             else:
                 dataset = dataset_type(osp.join(data_root, dataset_name), transform=transform)
+
         if label_file is not None:
-            new_labels = np.load(label_file).flatten()
-            assert len(dataset.targets) == len(new_labels)
-            noise_ratio = (1 - np.mean(np.array(dataset.targets) == new_labels))
-            dataset.targets = new_labels.tolist()
+            clean_train_labels = np.array(dataset.targets)
+            all_noisy_train_labels = np.asarray(torch.load(label_file))
+            # Calculate the number of labels to replace
+            num_to_replace = int(len(clean_train_labels) * noise_ratio)
+            # Randomly select indices to replace
+            np.random.seed(self.opt.seed)  # You can choose any integer value as the seed
+            indices_to_replace = np.random.choice(len(clean_train_labels), num_to_replace, replace=False)
+            # Create a copy of clean_train_labels to modify
+            modified_labels = clean_train_labels.copy()
+            # Replace the selected indices with noisy labels
+            modified_labels[indices_to_replace] = all_noisy_train_labels[indices_to_replace]
+            dataset.targets = modified_labels.tolist()
+
+            # reset the targets to new label_file
+            # noisy_targets = np.load(label_file).flatten()
+            # assert len(dataset.targets) == len(new_labels)
+            # noise_ratio = (1 - np.mean(np.array(dataset.targets) == new_labels))
+            # dataset.targets = new_labels.tolist()
+
             print(f'load label file from {label_file}, possible noise ratio {noise_ratio}')
+
+        if filtered_index is not None:
+            if filter_out:
+                dataset.data = [x for i, x in enumerate(dataset.data) if i not in filtered_index]
+                dataset.targets = [x for i, x in enumerate(dataset.targets) if i not in filtered_index]
+            else:
+                dataset.data = [x for i, x in enumerate(dataset.data) if i in filtered_index]
+                dataset.targets = [x for i, x in enumerate(dataset.targets) if i in filtered_index]
+
         return dataset, has_subfolder
 
     def build_dataloader(self,
@@ -179,36 +210,57 @@ class TrainTask(object):
                          train=False,
                          memory=False,
                          data_resample=False,
-                         label_file=None):
+                         label_file=None,
+                         noise_ratio=0.3,
+                         filtered_index=None,
+                         filter_out=False):
 
         opt = self.opt
         data_root = opt.data_folder
 
-        dataset, has_subfolder = self.create_dataset(data_root, dataset_name,
-                                                     train, transform=transform,
-                                                     memory=memory,
-                                                     label_file=label_file)
+        if train:
+            dataset, has_subfolder = self.create_dataset(data_root,
+                                                         dataset_name,
+                                                         train,
+                                                         transform=transform,
+                                                         memory=memory,
+                                                         label_file=label_file,
+                                                         noise_ratio=noise_ratio)
+        else: # testing set is split to easy and hard
+            dataset, has_subfolder = self.create_dataset(data_root,
+                                                         dataset_name,
+                                                         train,
+                                                         transform=transform,
+                                                         memory=memory,
+                                                         label_file=label_file,
+                                                         noise_ratio=0,
+                                                         filtered_index=filtered_index,
+                                                         filter_out=filter_out
+                                                         )
         labels = dataset.targets
         labels = np.array(labels)
 
         if opt.whole_dataset and has_subfolder:
-            ano_dataset = self.create_dataset(data_root, dataset_name, not train, transform=transform,
+            ano_dataset = self.create_dataset(data_root,
+                                              dataset_name,
+                                              not train,
+                                              transform=transform,
                                               memory=memory)[0]
             labels = np.concatenate([labels, ano_dataset.targets], axis=0)
             dataset = torch.utils.data.ConcatDataset([dataset, ano_dataset])
 
         with_indices = train and (not memory)
         if with_indices:
-            dataset = dataset_with_indices(dataset)
+            dataset = dataset_with_indices(dataset) # when dataset returns, it also returns the index
 
         if sampler:
             if dist.is_initialized():
                 from utils.sampler import RandomSampler
-                if shuffle and data_resample:
+                if shuffle and data_resample: # if perform shuffling
                     num_iter = len(dataset) // (batch_size * dist.get_world_size())
                     sampler = RandomSampler(dataset=dataset, batch_size=batch_size, num_iter=num_iter, restore_iter=0,
                                             weights=None, replacement=True, seed=0, shuffle=True)
-                else:
+                else: # no shuffling
                     sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=shuffle)
             else:
                 # memory loader
@@ -216,12 +268,6 @@ class TrainTask(object):
         else:
             sampler = None
 
-        # if opt.num_workers > 0:
-        #     prefetch_factor = max(2, batch_size // opt.num_workers)
-        #     persistent_workers = True
-        # else:
-        #     prefetch_factor = 2
-        #     persistent_workers = False
         prefetch_factor = 2
         persistent_workers = True
         dataloader = torch.utils.data.DataLoader(
@@ -323,10 +369,11 @@ class TrainTask(object):
             sampler=True,
             train=True,
             data_resample=opt.data_resample,
-            label_file=opt.label_file)
+            label_file=opt.label_file,
+            noise_ratio=opt.noise_ratio)
         if sampler is None:
             sampler = train_loader.sampler
-        self.logger.msg_str(f'set train dataloader with {len(train_loader)} iterations...')
+        self.logger.msg_str(f'set TRAIN dataloader with {len(train_loader)} iterations...')
 
         test_transform = self.test_transform(normalize)
         self.logger.msg_str(f'set test transform... \n {str(test_transform)}')
@@ -334,22 +381,40 @@ class TrainTask(object):
         if 'imagenet' in opt.dataset:
             if not opt.test_resized_crop:
                 warnings.warn('ImageNet should center crop during testing...')
-        test_loader = self.build_dataloader(opt.dataset,
+
+        hard_indices = np.load(opt.test_hard_indices)
+        easy_test_loader = self.build_dataloader(opt.dataset,
                                             test_transform,
                                             train=False,
                                             sampler=True,
-                                            batch_size=opt.batch_size)[0]
-        self.logger.msg_str(f'set test dataloader with {len(test_loader)} iterations...')
+                                            batch_size=opt.batch_size,
+                                            noise_ratio=0,
+                                            filtered_index=hard_indices,
+                                            filter_out=True)[0] # fixme
+        hard_test_loader = self.build_dataloader(opt.dataset,
+                                                 test_transform,
+                                                 train=False,
+                                                 sampler=True,
+                                                 batch_size=opt.batch_size,
+                                                 noise_ratio=0,
+                                                 filtered_index=hard_indices,
+                                                 filter_out=False)[0]  # fixme
+        self.logger.msg_str(f'set HARD test dataloader with {len(hard_test_loader)} iterations...')
+        self.logger.msg_str(f'set EASY test dataloader with {len(easy_test_loader)} iterations...')
+
+        # memory loader is the train loader with potential noises + test-time transformation + no shuffling
         memory_loader = self.build_dataloader(opt.dataset,
                                               test_transform,
                                               train=True,
                                               batch_size=opt.batch_size,
                                               sampler=True,
                                               memory=True,
-                                              label_file=opt.label_file)[0]
-        self.logger.msg_str(f'set memory dataloader with {len(memory_loader)} iterations...')
+                                              label_file=opt.label_file,
+                                              noise_ratio=opt.noise_ratio)[0]
+        self.logger.msg_str(f'set TRAIN MEMORY dataloader with {len(memory_loader)} iterations...')
 
-        self.test_loader = test_loader
+        self.hard_test_loader = hard_test_loader
+        self.easy_test_loader = easy_test_loader
         self.memory_loader = memory_loader
         self.train_loader = train_loader
         self.sampler = sampler
@@ -377,6 +442,8 @@ class TrainTask(object):
         #     self.psedo_labeling(n_iter)
         #     self.test(n_iter)
         self.psedo_labeling(n_iter)
+        self.test(self.easy_test_loader, n_iter)
+        self.test(self.hard_test_loader, n_iter)
         while True:
             self.sampler.set_epoch(self.cur_epoch)
             for inputs in self.train_loader:
@@ -399,7 +466,8 @@ class TrainTask(object):
                 self.psedo_labeling(n_iter)
 
             if (self.cur_epoch % opt.test_freq == 0) or apply_kmeans:
-                self.test(n_iter)
+                self.test(self.easy_test_loader, n_iter)
+                self.test(self.hard_test_loader, n_iter)
                 torch.cuda.empty_cache()
 
             self.cur_epoch += 1
@@ -411,12 +479,12 @@ class TrainTask(object):
         pass
 
     @torch.no_grad()
-    def test(self, n_iter):
+    def test(self, dataloader, n_iter):
         opt = self.opt
         if opt.whole_dataset:
             return
 
-        test_features, test_labels = extract_features(self.feature_extractor, self.test_loader)
+        test_features, test_labels = extract_features(self.feature_extractor, dataloader)
         if hasattr(self, 'mem_data') and self.mem_data['epoch'] == self.cur_epoch:
             mem_features, mem_labels = self.mem_data['features'], self.mem_data['labels']
         else:
@@ -477,20 +545,37 @@ class TrainTask(object):
         self.logger.msg([lr, ], n_iter)
 
     def clustering(self, features, n_clusters):
-        opt = self.opt
+        # opt = self.opt
+        #
+        # kwargs = {
+        #     'metric': 'cosine' if self.l2_normalize else 'euclidean',
+        #     'distributed': True,
+        #     'random_state': 0,
+        #     'n_clusters': n_clusters,
+        #     'verbose': True
+        # }
+        # clustering_model = torch_clustering.PyTorchKMeans(init='k-means++', max_iter=300, tol=1e-4, **kwargs)
+        #
+        # psedo_labels = clustering_model.fit_predict(features)
+        # cluster_centers = clustering_model.cluster_centers_
+        # Ensure features are in the right format
+        features = features.numpy().astype('float32')
 
-        kwargs = {
-            'metric': 'cosine' if self.l2_normalize else 'euclidean',
-            'distributed': True,
-            'random_state': 0,
-            'n_clusters': n_clusters,
-            'verbose': True
-        }
-        clustering_model = torch_clustering.PyTorchKMeans(init='k-means++', max_iter=300, tol=1e-4, **kwargs)
+        # Normalize features if needed
+        if self.l2_normalize:
+            faiss.normalize_L2(features)
 
-        psedo_labels = clustering_model.fit_predict(features)
-        cluster_centers = clustering_model.cluster_centers_
-        return psedo_labels, cluster_centers
+        # Create the FAISS index for clustering
+        index = faiss.IndexFlatIP(features.shape[1])  # Inner product for cosine similarity
+        kmeans = faiss.Kmeans(features.shape[1], n_clusters, niter=300, nredo=10, verbose=True)
+
+        # Train the KMeans model
+        kmeans.train(features)
+
+        # Get pseudo labels and cluster centers
+        pseudo_labels = kmeans.index.search(features, 1)[1].flatten()
+        cluster_centers = faiss.vector_float_to_array(kmeans.centroids)
+        return pseudo_labels, cluster_centers
 
     @torch.no_grad()
     def psedo_labeling(self, n_iter):

@@ -155,23 +155,47 @@ class TCL(TrainTask):
 
         self.evaluate(self.tcl, features, confidence, cluster_labels, labels, context_assignments, n_iter)
 
-    def evaluate(self, model, features, confidence, cluster_labels, labels, context_assignments, n_iter):
+    def evaluate(self, model, features, confidence, cluster_labels, labels, context_assignments, n_iter): # fixme
         opt = self.opt
+        # This is the original torchvision dataset without noisy labels
         clean_labels = torch.Tensor(
-            self.create_dataset(opt.data_folder, opt.dataset, train=True, transform=None)[0].targets).cuda().long()
+            self.create_dataset(opt.data_folder,
+                                opt.dataset,
+                                train=True,
+                                transform=None)[0].targets).cuda().long()
 
         is_clean = clean_labels.cpu().numpy() == labels.cpu().numpy()
         self.hist(context_assignments, is_clean, labels, n_iter)
         train_acc = (torch.argmax(cluster_labels, dim=1) == clean_labels).float().mean()
-        test_features, test_cluster_labels, test_labels = self.extract_features(model, self.test_loader)
-        test_acc = (test_labels == torch.argmax(test_cluster_labels, dim=1)).float().mean()
+
+        # EASY test
+        easy_test_features, easy_test_cluster_labels, easy_test_labels = self.extract_features(model, self.easy_test_loader)
+        easy_test_acc = (easy_test_labels == torch.argmax(easy_test_cluster_labels, dim=1)).float().mean()
 
         from utils.knn_monitor import knn_predict
-        knn_labels = knn_predict(test_features, features, clean_labels,
-                                 classes=self.num_cluster, knn_k=200, knn_t=0.1)[:, 0]
-        self.logger.msg_str(torch.unique(torch.argmax(test_cluster_labels, dim=1), return_counts=True))
+        easy_knn_labels = knn_predict(easy_test_features,
+                                      features,
+                                      clean_labels,
+                                      classes=self.num_cluster,
+                                      knn_k=200,
+                                      knn_t=0.1)[:, 0]
+        self.logger.msg_str(torch.unique(torch.argmax(easy_test_cluster_labels, dim=1), return_counts=True))
 
-        knn_acc = (test_labels == knn_labels).float().mean()
+        easy_knn_acc = (easy_test_labels == easy_knn_labels).float().mean()
+
+        # HRAD test
+        hard_test_features, hard_test_cluster_labels, hard_test_labels = self.extract_features(model, self.hard_test_loader)
+        hard_test_acc = (hard_test_labels == torch.argmax(hard_test_cluster_labels, dim=1)).float().mean()
+
+        hard_knn_labels = knn_predict(hard_test_features,
+                                      features,
+                                      clean_labels,
+                                      classes=self.num_cluster,
+                                      knn_k=200,
+                                      knn_t=0.1)[:, 0]
+        self.logger.msg_str(torch.unique(torch.argmax(hard_test_cluster_labels, dim=1), return_counts=True))
+
+        hard_knn_acc = (hard_test_labels == hard_knn_labels).float().mean()
 
         estimated_noise_ratio = (confidence > 0.5).float().mean().item()
         if opt.scale1 is None:
@@ -183,7 +207,9 @@ class TCL(TrainTask):
         from sklearn.metrics import roc_auc_score
         context_noise_auc = roc_auc_score(is_clean, confidence.cpu().numpy())
         self.logger.msg([estimated_noise_ratio, noise_accuracy,
-                         context_noise_auc, train_acc, test_acc, knn_acc], n_iter)
+                         context_noise_auc, train_acc,
+                         easy_test_acc, easy_knn_acc,
+                         hard_test_acc, hard_knn_acc], n_iter)
 
     def correct_labels(self, model, labels):
         opt = self.opt
@@ -223,7 +249,7 @@ class TCL(TrainTask):
         confidence = torch.from_numpy(confidence).float().cuda()
         return confidence, context_assignments, centers
 
-    def test(self, n_iter):
+    def test(self, dataloader, n_iter):
         pass
 
     def train_transform(self, normalize):
